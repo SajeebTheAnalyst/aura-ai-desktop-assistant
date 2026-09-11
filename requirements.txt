@@ -1,12 +1,10 @@
-PySide6>=6.7,<7
-python-dotenv>=1.0,<2
-faster-whisper>=1.1,<2
-sounddevice>=0.5,<1
-numpy>=1.26,<3
-# Local Windows text-to-speech provider
-pyttsx3==2.99
-openai==2.41.0
-psutil==7.2.2
-# pywin32>=306
-# pyautogui>=0.9.54
-# pandas>=2.2
+python-dotenv
+google-genai
+PySide6
+SpeechRecognition
+edge-tts
+pyttsx3
+AppOpener
+pyautogui
+sounddevice
+numpy

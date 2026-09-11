@@ -1,1 +1,0 @@
-"""Allowlisted desktop and browser automation adapters."""
