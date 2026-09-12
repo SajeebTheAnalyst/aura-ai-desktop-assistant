@@ -5,11 +5,17 @@ service owns exactly one worker thread and a queue. ``speak()`` only enqueues
 text and returns immediately; the worker initializes the engine lazily and
 speaks each utterance in order. ``warmup()`` pre-initializes the engine right
 after app start so the very first spoken reply is instant.
+
+If an utterance fails (dead COM object, crashed audio driver, device change),
+the error is caught silently, the engine is re-initialized and the utterance is
+retried - callers never see audio failures, so the assistant never says things
+like "I cannot produce sound".
 """
 from __future__ import annotations
 
 import queue
 import threading
+import time
 from typing import Any
 
 _WARMUP = object()  # sentinel: initialize the engine without speaking
@@ -50,23 +56,28 @@ class TTSService:
                     except Exception as exc:
                         self.last_error = str(exc)
                 continue
-            # A real utterance.
+            # A real utterance. If the audio engine fails (dead COM object,
+            # crashed driver, device change), catch it SILENTLY, re-initialize
+            # the engine and retry - the LLM/voice loop never sees the failure
+            # and never says anything like "I cannot produce sound".
             text = item
-            try:
-                if engine is None:
-                    engine = self._make_engine()
-                engine.say(text)
-                engine.runAndWait()
-            except Exception as exc:
-                self.last_error = str(exc)
-                if engine is not None:
-                    try:
-                        engine.stop()
-                    except Exception:
-                        pass
-                    engine = None
-            finally:
-                self._idle.set()
+            for attempt in range(3):
+                try:
+                    if engine is None:
+                        engine = self._make_engine()
+                    engine.say(text)
+                    engine.runAndWait()
+                    break
+                except Exception as exc:
+                    self.last_error = str(exc)
+                    if engine is not None:
+                        try:
+                            engine.stop()
+                        except Exception:
+                            pass
+                    engine = None  # force a fresh engine on the next attempt
+                    time.sleep(0.25 * (attempt + 1))
+            self._idle.set()  # finished (spoken, or retries exhausted - silently)
 
     def warmup(self) -> None:
         """Pre-initialize the engine in the background (never blocks)."""

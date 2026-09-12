@@ -6,15 +6,23 @@ Design rules:
 - OPEN_APP resolves apps via PATH, well-known install locations, then the
   Windows ``start`` launcher; unknown apps degrade to a web search.
 - SYSTEM_ACTION handles shutdown / restart / sleep / lock / settings.
-- WEB_SEARCH opens YouTube / Google / other sites, or runs a Google query.
+- WEB_SEARCH opens Google / other sites, or runs a Google query.
+- PLAY_MUSIC plays the requested song on YouTube immediately: direct
+  top-result parsing of the YouTube search page (8 s timeout) with pywhatkit's
+  ``playonyt`` local scrape as fallback - never a stuck search/playlist tab.
+  Re-triggers of the same song are deduplicated (no duplicate browser tabs; the
+  playing window is refocused instead).
 - ``dry_run=True`` returns the would-be command instead of executing it
   (used for safe testing of destructive actions).
 """
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import threading
+import time
 import webbrowser
 from typing import Any
 from urllib.parse import quote
@@ -201,6 +209,103 @@ def _web_search(target: str, dry_run: bool = False) -> str:
     return f"Searching Google for {name}."
 
 
+def _play_music(target: str, dry_run: bool = False) -> str:
+    """Play a song on YouTube immediately - top result, never a search tab.
+
+    Order: pywhatkit.playonyt (if installed) -> direct top-result parsing of
+    the YouTube search page -> plain YouTube search tab as a last resort.
+    Re-triggers of the same song inside the dedup window never open a duplicate
+    tab; the window already playing it is refocused instead.
+    """
+    song = (target or "").strip()
+    if not song:
+        return "Which song should I play?"
+    key = song.lower()
+    now = time.time()
+    with _music_lock:
+        recently = now - _music_cache.get(key, 0.0) < _MUSIC_DEDUP_SECONDS
+    if recently and not dry_run:
+        # Same song re-triggered: do NOT open a duplicate tab - refocus the
+        # YouTube window that is already playing it.
+        _refocus_youtube_window()
+        return f"Already playing {song.title()}."
+    if dry_run:
+        return f"[dry-run] playonyt('{song}') -> top YouTube result with autoplay"
+    with _music_lock:
+        _music_cache[key] = now
+
+    # 1) Direct search-query parsing: scrape the top result's video id
+    #    (bounded by an 8 s timeout - the fastest, most reliable path).
+    video_id = _extract_youtube_video_id(song)
+    if video_id:
+        try:
+            webbrowser.open(f"https://www.youtube.com/watch?v={video_id}&autoplay=1")
+            return f"Playing {song.title()}."
+        except Exception:
+            pass
+
+    # 2) pywhatkit.playonyt - its LOCAL scrape picks the top watch result.
+    #    (use_api stays False: the pywhatkit.herokuapp.com API is defunct.)
+    try:
+        from pywhatkit import playonyt  # lazy: heavy import, music requests only
+
+        playonyt(song)
+        return f"Playing {song.title()}."
+    except Exception:
+        pass
+
+    # 3) Last resort: a YouTube search tab for the song.
+    try:
+        webbrowser.open(f"https://www.youtube.com/results?search_query={quote(song)}")
+        return f"Playing {song.title()}."
+    except Exception:
+        return f"I could not start {song.title()}."
+
+
+def _refocus_youtube_window() -> bool:
+    """Bring an already-open YouTube window/tab to the front. Never raises."""
+    try:
+        import pygetwindow as gw
+
+        for window in gw.getAllWindows():
+            if "youtube" in (window.title or "").lower():
+                try:
+                    if window.isMinimized:
+                        window.restore()
+                    window.activate()
+                    return True
+                except Exception:
+                    return False
+    except Exception:
+        return False
+    return False
+
+
+def _extract_youtube_video_id(song: str) -> str | None:
+    """Direct search-query parsing: return the top result's 11-char video id."""
+    try:
+        import requests
+
+        response = requests.get(
+            "https://www.youtube.com/results",
+            params={"search_query": song},
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+            timeout=8,
+        )
+        if response.status_code != 200:
+            return None
+        match = re.search(r'"videoId":"([A-Za-z0-9_-]{11})"', response.text)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+# ---- music playback dedup state ----
+_MUSIC_DEDUP_SECONDS = 12.0  # window in which re-triggers reuse the open tab
+_music_cache: dict[str, float] = {}  # song -> last triggered epoch (seconds)
+_music_lock = threading.Lock()
+
+
 def execute_system_command(intent_data: dict[str, Any] | None, *, dry_run: bool = False) -> str:
     """Execute an intent plan and return the short spoken reply. Never raises.
 
@@ -218,6 +323,8 @@ def execute_system_command(intent_data: dict[str, Any] | None, *, dry_run: bool 
             reply = _system_action(target, dry_run)
         elif intent == "WEB_SEARCH":
             reply = _web_search(target, dry_run)
+        elif intent == "PLAY_MUSIC":
+            reply = _play_music(target, dry_run)
         else:
             return response or "I did not understand that command."
     except Exception as exc:  # final safety net - always speak something

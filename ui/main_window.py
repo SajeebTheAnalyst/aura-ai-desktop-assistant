@@ -9,6 +9,7 @@ QtWebChannel bridge (mic click, minimize, close, drag).
 from __future__ import annotations
 
 import json
+import threading
 
 from PySide6.QtCore import QObject, QTimer, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -471,9 +472,12 @@ class VoiceLoopWorker(QThread):
             self.transcript_ready.emit(transcript)
             self.state_changed.emit("THINKING")
             result = self.assistant.process(transcript)
-            self.response_ready.emit(result)
+            # The UI handler logs the text to the chat AND queues it for TTS
+            # (1:1 chat/voice sync); `spoken` handshakes that it was queued.
+            spoken = threading.Event()
+            self.response_ready.emit((result, spoken))
             self.state_changed.emit("ANSWERING")
-            self.assistant.speak(result.text)  # non-blocking background TTS
+            spoken.wait(timeout=10)            # wait until the UI queued speech
             self.assistant.wait_for_speech()   # pause STT until voice finishes
         except Exception:
             self.state_changed.emit("IDLE")
@@ -539,10 +543,22 @@ class MainWindow(QMainWindow):
         if self._visualizer_ready:
             self.visualizer.page().runJavaScript(f"window.addMessage('user', {json.dumps(text)});")
 
-    def _handle_response(self, result: AssistantResponse) -> None:
-        """Stream every LLM response into the Chat transcript."""
-        if self._visualizer_ready:
-            self.visualizer.page().runJavaScript(f"window.addMessage('aura', {json.dumps(result.text)});")
+    def _handle_response(self, payload) -> None:
+        """Log the reply to the Chat transcript and speak the exact same text.
+
+        Whatever lands in the chat is exactly what AURA says - the chat text
+        and the TTS queue are always 1:1 synchronized.
+        """
+        spoken = None
+        try:
+            result, spoken = payload
+            text = result.text
+            if self._visualizer_ready:
+                self.visualizer.page().runJavaScript(f"window.addMessage('aura', {json.dumps(text)});")
+            self.assistant.speak(text)  # non-blocking: queues on the TTS worker
+        finally:
+            if spoken is not None:
+                spoken.set()
 
     def _worker_finished(self, worker: VoiceLoopWorker) -> None:
         if self.worker is worker:

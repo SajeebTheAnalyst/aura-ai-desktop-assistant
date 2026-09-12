@@ -50,7 +50,7 @@ class Assistant:
             match plan.intent:
                 case Intent.CHAT:
                     return plan.response
-                case Intent.OPEN_APP | Intent.SYSTEM_ACTION | Intent.WEB_SEARCH:
+                case Intent.OPEN_APP | Intent.SYSTEM_ACTION | Intent.WEB_SEARCH | Intent.PLAY_MUSIC:
                     return execute_system_command(
                         {"intent": plan.intent.value, "target": plan.target, "response": plan.response}
                     )

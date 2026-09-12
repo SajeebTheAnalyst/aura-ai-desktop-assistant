@@ -22,6 +22,7 @@ class Intent(StrEnum):
     OPEN_APP = "OPEN_APP"
     SYSTEM_ACTION = "SYSTEM_ACTION"
     WEB_SEARCH = "WEB_SEARCH"
+    PLAY_MUSIC = "PLAY_MUSIC"
 
 
 @dataclass(frozen=True)
@@ -89,7 +90,7 @@ class LLMService:
         local = self._classify_locally(text)
         is_simple_command = (
             local.intent is not Intent.CHAT
-            and len(text.split()) <= 5
+            and len(text.split()) <= 7
             and not any(q in text.lower() for q in self._QUESTION_WORDS)
         )
         if is_simple_command:
@@ -219,6 +220,15 @@ class LLMService:
             return CommandPlan.chat(raw)
         is_question = any(q in t for q in cls._QUESTION_WORDS)
         has_verb = any(v in t for v in cls._ACTION_VERBS)
+
+        # 0) Music requests: "play <song> on youtube", "play shape of you".
+        if t.startswith("play ") and not is_question:
+            song = t[len("play "):].strip()
+            song = re.sub(r"\s+on\s+(?:youtube|yt|the\s+internet|music)\b.*$", "", song).strip()
+            song = re.sub(r"^(?:some|the|a|an)\s+", "", song).strip()
+            app_keys = {key for _, key in cls._APPS}
+            if song and "youtube" not in song and song not in app_keys:
+                return CommandPlan(Intent.PLAY_MUSIC, song, f"Playing {song.title()}.")
 
         # 1) System actions (shutdown/sleep/etc.) - only when imperative.
         if not is_question:

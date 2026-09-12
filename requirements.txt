@@ -8,3 +8,4 @@ AppOpener
 pyautogui
 sounddevice
 numpy
+pywhatkit
