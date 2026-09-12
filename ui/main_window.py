@@ -457,42 +457,101 @@ class Bridge(QObject):
 
 
 class VoiceLoopWorker(QThread):
+    """One voice turn: capture (VAD) -> transcribe -> think -> answer -> speak.
+
+    The generation tag lets the controller ignore results from stale workers
+    (e.g. a capture that finishes after Pause/Stop started a new session).
+    """
+
     state_changed = Signal(str)
+    notice = Signal(str)
     transcript_ready = Signal(str)
     response_ready = Signal(object)
+    turn_finished = Signal(int, bool)  # (generation, continue_session)
 
-    def __init__(self, assistant: Assistant) -> None:
+    def __init__(self, assistant: Assistant, generation: int = 0) -> None:
         super().__init__()
         self.assistant = assistant
+        self.generation = generation
+        self.cancel_event = threading.Event()
 
     def run(self) -> None:
+        continue_session = False
         try:
             self.state_changed.emit("LISTENING")
-            transcript = self.assistant.listen()
+            if self.cancel_event.is_set():
+                raise RuntimeError("Listening cancelled.")
+            pcm = self.assistant.listen_audio(
+                lambda sub: self.state_changed.emit(sub) if sub in ("LISTENING", "TRANSCRIBING") else None,
+                cancel_event=self.cancel_event,
+            )
+            if self.cancel_event.is_set():
+                raise RuntimeError("Listening cancelled.")
+            self.state_changed.emit("TRANSCRIBING")
+            transcript = self.assistant.transcribe_audio(pcm)
+            if self.cancel_event.is_set():
+                raise RuntimeError("Listening cancelled.")
+            transcript = (transcript or "").strip()
+            if not transcript:
+                # Empty/near-empty utterance: never enters Gemini. Tell the UI
+                # we are still live and let it schedule the next turn.
+                self.notice.emit("EMPTY_TRANSCRIPT")
+                continue_session = True
+                return
             self.transcript_ready.emit(transcript)
             self.state_changed.emit("THINKING")
+            if self.cancel_event.is_set():
+                raise RuntimeError("Listening cancelled.")
             result = self.assistant.process(transcript)
+            if self.cancel_event.is_set():
+                raise RuntimeError("Listening cancelled.")
             # The UI handler logs the text to the chat AND queues it for TTS
             # (1:1 chat/voice sync); `spoken` handshakes that it was queued.
             spoken = threading.Event()
             self.response_ready.emit((result, spoken))
             self.state_changed.emit("ANSWERING")
-            spoken.wait(timeout=10)            # wait until the UI queued speech
+            if not spoken.wait(timeout=10):  # UI gone or busy - do not stall forever
+                return
             self.assistant.wait_for_speech()   # pause STT until voice finishes
-        except Exception:
-            self.state_changed.emit("IDLE")
+            continue_session = True
+        except Exception as exc:
+            # Never throw out of the thread: report, then let the controller
+            # decide whether the session continues. This catches STT/audio
+            # device timeouts, microphone disconnections, etc.
+            self.notice.emit(f"TURN_ERROR: {type(exc).__name__}: {exc}")
+        except BaseException as exc:
+            # Catch KeyboardInterrupt and other non-StandardError exceptions
+            # that the above block would miss. Never let an exception escape
+            # the thread — it would terminate the Qt event loop silently.
+            self.notice.emit(f"TURN_ERROR: {type(exc).__name__}: {exc}")
+        finally:
+            # Guarantee the signal is always emitted exactly once, even if the
+            # except block above raises or the return paths were inconsistent.
+            self.turn_finished.emit(self.generation, continue_session)
 
 
 class MainWindow(QMainWindow):
-    """Frameless Jarvis-style HUD with a neon orb, status line, and chat log."""
+    """Frameless Jarvis-style HUD with a neon orb, status line, and chat log.
+
+    Owns the authoritative voice-session lifecycle:
+
+    * ``session_active``  - a voice session is running (started with Listen).
+    * ``paused``          - LISTENING is suspended until Resume.
+    * ``generation``      - bumps on every Pause/Stop/loop-start so results
+      from stale workers can never schedule a new turn.
+    * ``worker``          - at most ONE ``VoiceLoopWorker`` exists at a time.
+    """
 
     def __init__(self, assistant: Assistant) -> None:
         super().__init__()
         self.assistant = assistant
         self.worker: VoiceLoopWorker | None = None
-        self.voice_loop_enabled = False
+        self.session_active = False
+        self.paused = False
+        self.generation = 0
         self._visualizer_ready = False
         self._pending_visualizer_state = "IDLE"
+        self._consecutive_errors = 0
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("AURA")
@@ -513,28 +572,95 @@ class MainWindow(QMainWindow):
 
         QShortcut(QKeySequence("Ctrl+Shift+Q"), self, self.stop_voice_loop)
 
+    # ---------------- voice session controls (Listen / Pause / Stop) ----------------
+
     def start_voice_loop(self) -> None:
-        self.voice_loop_enabled = True
+        """Start a fresh conversational voice session (press Listen once)."""
+        self.generation += 1
+        self.session_active = True
+        self.paused = False
+        self._consecutive_errors = 0
+        self.assistant.ping()
+        self._set_visualizer_state("LISTENING")
         self._listen_next()
 
+    def pause_voice_loop(self) -> None:
+        """Pause safely: stop the mic now, never auto-start, drain the TTS.
+
+        We intentionally do NOT call ``worker.quit()`` here: ``quit()`` only
+        works when the thread is running an event loop (``exec()``), and
+        ``VoiceLoopWorker.run()`` blocks on microphone capture instead.
+        Calling ``quit()`` + ``wait(2000)`` would block the GUI for 2 s while
+        the native thread is STILL alive; if the window were then closed, Qt
+        would destroy that running thread and emit the crash we are fixing.
+        Instead we just raise ``cancel_event``; the thread exits naturally the
+        next time it checks the flag, and ``_on_worker_finished`` reaps it.
+        """
+        if not self.session_active:
+            return
+        self.generation += 1
+        self.paused = True
+        self.assistant.request_stop()
+        self.assistant.tts.wait_until_idle(5.0)
+        if self.worker is not None:
+            self.worker.cancel_event.set()
+        self._set_visualizer_state("PAUSED")
+
+    def resume_voice_loop(self) -> None:
+        """Resume after Pause: allow exactly one guarded listening cycle."""
+        if not self.session_active or not self.paused:
+            return
+        self.paused = False
+        self._consecutive_errors = 0
+        self.assistant.ping()
+        self._set_visualizer_state("LISTENING")
+        # Delegate to _listen_next, which polls if the old worker is still running.
+        self._listen_next()
+
+
+
     def stop_voice_loop(self) -> None:
-        self.voice_loop_enabled = False
+        self.generation += 1
+        self.session_active = False
+        self.paused = False
+        # Do NOT call worker.quit()+wait() here — same reasoning as
+        # pause_voice_loop: quit() is ignored for non-event-loop threads and
+        # wait() would block the GUI while the native thread is still alive.
+        # Instead we just raise cancel_event; the thread exits naturally the
+        # next time it checks the flag, and _on_worker_finished reaps it.
+        if self.worker is not None:
+            self.worker.cancel_event.set()
         self.assistant.stop()
         self._set_visualizer_state("IDLE")
 
     def trigger_listen(self) -> None:
         """Invoked by the mic button; asks for a fresh listen right now."""
-        self.voice_loop_enabled = True
-        self._listen_next()
+        self.start_voice_loop()
 
     def _listen_next(self) -> None:
-        if not self.voice_loop_enabled or self.worker is not None:
+        if not self.session_active or self.paused:
             return
-        worker = VoiceLoopWorker(self.assistant)
-        worker.state_changed.connect(self._set_visualizer_state)
+        if self.worker is not None:
+            if self.worker.isRunning():
+                # Old worker still physically running (native C++ thread). Poll
+                # until its `finished` signal fires and clears self.worker.
+                QTimer.singleShot(50, self._listen_next)
+                return
+            # Worker has finished running but not yet reaped. Schedule safe
+            # deletion (deleteLater) and clear the reference.
+            old_worker = self.worker
+            self.worker = None
+            old_worker.deleteLater()
+        worker = VoiceLoopWorker(self.assistant, self.generation)
+        # Parent the worker to self so it lives as long as the window (prevents
+        # Python GC from collecting it mid-run even if self.worker is cleared).
+        worker.setParent(self)
+        worker.state_changed.connect(self._on_worker_state)
+        worker.notice.connect(self._on_worker_notice)
         worker.transcript_ready.connect(self._handle_transcript)
         worker.response_ready.connect(self._handle_response)
-        worker.finished.connect(lambda: self._worker_finished(worker))
+        worker.turn_finished.connect(self._on_turn_finished)
+        worker.finished.connect(self._on_worker_finished)
         self.worker = worker
         worker.start()
 
@@ -543,12 +669,71 @@ class MainWindow(QMainWindow):
         if self._visualizer_ready:
             self.visualizer.page().runJavaScript(f"window.addMessage('user', {json.dumps(text)});")
 
+    # ---------------- voice worker callbacks (generation-guarded) ----------------
+
+    def _on_worker_state(self, state: str) -> None:
+        sender = self.sender()
+        if sender is not self.worker:
+            return  # stale worker: ignore its display state, never drive the orb
+        self._set_visualizer_state(state)
+
+    def _on_worker_notice(self, notice: str) -> None:
+        sender = self.sender()
+        if sender is not self.worker:
+            return
+        if notice == "EMPTY_TRANSCRIPT":
+            # Not an error: just keep the orb honest while we listen again.
+            self._set_visualizer_state("LISTENING")
+            return
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= 8:
+            self.stop_voice_loop()
+            self._set_visualizer_state("ERROR")
+        else:
+            self._set_visualizer_state("ERROR")
+            QTimer.singleShot(400, lambda: self._recover_from_error())
+
+    def _recover_from_error(self) -> None:
+        if self.session_active and not self.paused:
+            self._set_visualizer_state("LISTENING")
+            self._listen_next()
+
+    def _on_turn_finished(self, generation: int, continue_session: bool) -> None:
+        sender = self.sender()
+        if sender is not self.worker or generation != self.generation:
+            return  # stale turn result: must never schedule anything
+        # NOTE: Do NOT clear self.worker here. turn_finished is emitted from
+        # within the worker's run() method, BEFORE the native C++ thread has
+        # actually stopped. Clearing self.worker now would let Python GC collect
+        # the QThread while it's still running, triggering Qt's
+        # "QThread: Destroyed while thread is still running" warning. The
+        # `finished` signal (handled by _on_worker_finished) fires AFTER the
+        # thread stops and is the only safe place to reap the worker.
+        self._consecutive_errors = 0
+        if continue_session and self.session_active and not self.paused:
+            # The old worker is still running; _listen_next will poll until its
+            # `finished` signal fires and self.worker is cleared.
+            QTimer.singleShot(150, self._listen_next)
+
+    def _on_worker_finished(self) -> None:
+        """Safe cleanup: called AFTER the native thread has actually stopped."""
+        sender = self.sender()
+        if isinstance(sender, VoiceLoopWorker):
+            sender.deleteLater()
+        if self.worker is sender:
+            self.worker = None
+        if self.session_active and not self.paused:
+            QTimer.singleShot(250, self._listen_next)
+
     def _handle_response(self, payload) -> None:
         """Log the reply to the Chat transcript and speak the exact same text.
 
         Whatever lands in the chat is exactly what AURA says - the chat text
         and the TTS queue are always 1:1 synchronized.
         """
+        sender = self.sender()
+        if sender is not self.worker:
+            return  # stale worker's reply must not be spoken or re-queued
         spoken = None
         try:
             result, spoken = payload
@@ -559,13 +744,6 @@ class MainWindow(QMainWindow):
         finally:
             if spoken is not None:
                 spoken.set()
-
-    def _worker_finished(self, worker: VoiceLoopWorker) -> None:
-        if self.worker is worker:
-            self.worker = None
-        self._set_visualizer_state("IDLE")
-        if self.voice_loop_enabled:
-            QTimer.singleShot(150, self._listen_next)
 
     def _visualizer_loaded(self, success: bool) -> None:
         self._visualizer_ready = success
@@ -586,4 +764,18 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.stop_voice_loop()
+        # If the native thread is still running, don't let Qt destroy it.
+        # Reject the close event, set the cancel flag, and poll. When the
+        # thread's `finished` signal fires, `_on_worker_finished` will call
+        # `self._close_after_worker_done()` which accepts the close event.
+        if self.worker is not None and self.worker.isRunning():
+            self._pending_close = True
+            self.worker.finished.connect(self._close_after_worker_done)
+            event.ignore()
+            return
         event.accept()
+
+    def _close_after_worker_done(self) -> None:
+        """Called from _on_worker_finished when the window was closing."""
+        self._pending_close = False
+        self.close()

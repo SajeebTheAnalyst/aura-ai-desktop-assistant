@@ -87,6 +87,9 @@ class LLMService:
         # 2-second end-to-end latency budget. Questions and complex text are
         # delegated to the language model below.
         text = (user_prompt or "").strip()
+        profile = self._profile_reply(text)
+        if profile is not None:
+            return profile
         local = self._classify_locally(text)
         is_simple_command = (
             local.intent is not Intent.CHAT
@@ -210,6 +213,20 @@ class LLMService:
     )
     _ACTION_VERBS = ("open", "launch", "start", "run", "play", "go")
     _QUESTION_WORDS = ("what", "who", "why", "how", "when", "can you", "tell me", "about", "please")
+
+    @classmethod
+    def _profile_reply(cls, text: str) -> CommandPlan | None:
+        """Instant, factual replies for frequent Sajeeb/AURA profile questions."""
+        query = (text or "").casefold()
+        if any(phrase in query for phrase in ("who are you", "what are you", "tumi ke", "tumi ki")):
+            return CommandPlan.chat("I am AURA, your assistant for analytics, automation, and Windows tasks.")
+        if any(phrase in query for phrase in ("my name", "who am i", "amar nam", "ami ke")):
+            return CommandPlan.chat("You are Sajeeb, a data analyst and AI automation specialist.")
+        if any(phrase in query for phrase in ("my skill", "my skills", "amar skill", "amar skills")):
+            return CommandPlan.chat("Your core skills are Python, SQL, Power BI, Excel, and AI automation.")
+        if any(phrase in query for phrase in ("about me", "what do you know about me", "amar bepare", "amar somporke", "my portfolio")):
+            return CommandPlan.chat("You build analytics dashboards, AI web apps, and workflow automations for your portfolio.")
+        return None
 
     @classmethod
     def _classify_locally(cls, text: str) -> CommandPlan:

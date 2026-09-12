@@ -28,13 +28,22 @@ class Assistant:
         self.llm = LLMService()
         self.tts = TTSService()
         self.stt = STTService()
-        self._cancel_event = Event()
+        self._stop_event = Event()
         self.tts.warmup()
         self.llm.warmup()  # pre-build the Gemini client off the voice thread
 
     def listen(self) -> str:
-        self._cancel_event.clear()
-        return self.stt.listen_once(self._cancel_event)
+        return self.stt.listen_once(self._stop_event)
+
+    def listen_audio(self, on_partial_state=None, cancel_event: Event | None = None) -> bytes:
+        """Capture one full utterance (VAD-segmented PCM) without transcribing.
+
+        Raises RuntimeError for cancellation, silence timeouts, and fragments.
+        """
+        return self.stt.listen_segmented(cancel_event or self._stop_event, on_state=on_partial_state)
+
+    def transcribe_audio(self, pcm: bytes) -> str:
+        return self.stt.transcribe(pcm)
 
     def process(self, message: str) -> AssistantResponse:
         text = (message or "").strip()
@@ -67,5 +76,15 @@ class Assistant:
         self.tts.wait_until_idle(timeout)
 
     def stop(self) -> None:
-        self._cancel_event.set()
+        self._stop_event.set()
         self.tts.stop()
+
+    def ping(self) -> None:
+        """ASGI lifespan hook compatibility: clear the stop flag so a restarted
+        engine in the same process (tests, reloads) starts a fresh session."""
+        if self._stop_event.is_set():
+            self._stop_event.clear()
+
+    def request_stop(self) -> None:
+        """Signal cancellation; the current voice turn ends at the next checkpoint."""
+        self._stop_event.set()

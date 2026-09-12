@@ -14,7 +14,7 @@ APP_NAME = "AURA"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
-GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "100"))
+GEMINI_MAX_OUTPUT_TOKENS = min(int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "64")), 64)
 
 
 def resolve_path(*parts: str) -> Path:
